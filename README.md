@@ -1,5 +1,5 @@
 # IAP_A1
-
+<pre>
 Project Structure:
 A1/
 ├── src/
@@ -15,3 +15,4 @@ A1/
 │   └── report.pdf          # Your 2-4 page design report
 ├── requirements.txt        # bcrypt, redis, etc.
 └── README.md               # Setup and testing instructions
+</pre>
