@@ -31,7 +31,12 @@ def start_client():
             msg = input("> ")
             if msg.lower() == 'exit':
                 break
-            client_socket.sendall(msg.encode('utf-8'))
+            # client_socket.sendall(msg.encode('utf-8'))
+            try:
+                client_socket.sendall(msg.encode('utf-8'))
+            except (BrokenPipeError, ConnectionResetError):
+                print("\n[DISCONNECTED] You have been logged out or the server went down.")
+                break
     except KeyboardInterrupt:
         pass
     finally:

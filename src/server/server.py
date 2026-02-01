@@ -1,78 +1,133 @@
 import socket
 import threading
+import bcrypt
 
 # Configuration
 HOST = '127.0.0.1'
 PORT = 65432
 
-# Shared State
-clients = {} # Mapping of socket objects to usernames (or addresses)
-clients_lock = threading.Lock()
+# In-memory "Database" for testing (Problem 2)
+# Format: { username: hashed_password }
+user_db = {
+    "abhijna": bcrypt.hashpw("kgp123".encode(), bcrypt.gensalt()),
+    "gemini": bcrypt.hashpw("password123".encode(), bcrypt.gensalt())
+}
+
+# Active Sessions: { username: socket_object }
+active_sessions = {}
+sessions_lock = threading.Lock()
 
 def broadcast(message, sender_socket=None):
-    """Sends a message to all connected clients except the sender."""
-    with clients_lock:
-        for client_sock in clients:
-            if client_sock != sender_socket:
+    """Sends a message to all currently active authenticated users."""
+    with sessions_lock:
+        for user_sock in list(active_sessions.values()):
+            if user_sock != sender_socket:
                 try:
-                    client_sock.sendall(message.encode('utf-8'))
-                except Exception as e:
-                    print(f"Error broadcasting to a client: {e}")
+                    user_sock.sendall(f"{message}\n".encode())
+                except:
+                    # If sending fails, the socket is likely closed
+                    pass
 
-def handle_client(client_socket, client_address):
-    """Main loop for handling an individual client connection."""
-    print(f"[NEW CONNECTION] {client_address} connected.")
-    
-    with clients_lock:
-        clients[client_socket] = client_address
-
+def handle_client(client_socket, addr):
+    username = None
     try:
+        # --- Problem 2: Authentication Phase ---
         while True:
-            # Blocking call to receive data
+            client_socket.sendall(b"AUTH_REQUIRED: Please login using 'LOGIN <username> <password>'\n")
+            data = client_socket.recv(1024).decode().strip()
+            if not data:
+                return
+
+            parts = data.split()
+            if not parts:
+                continue
+                
+            command = parts[0].upper() 
+
+            if len(parts) == 3 and command == "LOGIN":
+                input_user, input_pass = parts[1], parts[2]
+
+                # Check if user exists and password is correct
+                if input_user in user_db and bcrypt.checkpw(input_pass.encode(), user_db[input_user]):
+                    
+                    # --- Problem 3: Force Logout Policy ---
+                    with sessions_lock:
+                        if input_user in active_sessions:
+                            old_sock = active_sessions[input_user]
+                            try:
+                                # Notify the old client before closing
+                                old_sock.sendall(b"FORCED_LOGOUT: Your account logged in from another location.\n")
+                                old_sock.close()
+                            except:
+                                pass
+                            print(f"[AUTH] Forced logout for user: {input_user}")
+                        
+                        # Establish new session
+                        active_sessions[input_user] = client_socket
+                        username = input_user
+                    
+                    client_socket.sendall(f"AUTH_SUCCESS: Welcome {username}!\n".encode())
+                    broadcast(f"SYSTEM: {username} has joined the chat.")
+                    break
+                else:
+                    client_socket.sendall(b"AUTH_FAILED: Invalid username or password.\n")
+            else:
+                client_socket.sendall(b"ERROR: Invalid command. Format: LOGIN <username> <password>\n")
+
+        # --- Problem 1 & 3: Chat Phase ---
+        while True:
+            # 1. Blocking wait for data
             data = client_socket.recv(1024)
             if not data:
                 break
-            
-            message = data.decode('utf-8')
-            print(f"[{client_address}] {message}")
-            
-            # Broadcast the received message to everyone else
-            broadcast(f"Client {client_address}: {message}", sender_socket=client_socket)
-            
-    except ConnectionResetError:
-        print(f"[DISCONNECT] {client_address} reset the connection.")
+
+            # 2. VALIDITY CHECK (The "Force Logout" Thread Killer)
+            # If a newer thread has taken over this username, this socket 
+            # will no longer match the one in active_sessions.
+            with sessions_lock:
+                if active_sessions.get(username) != client_socket:
+                    print(f"[DEBUG] Thread for {username} (old session) exiting.")
+                    return # Exit function/thread immediately
+
+            msg = data.decode().strip()
+            if msg:
+                print(f"[{username}] {msg}")
+                broadcast(f"{username}: {msg}", sender_socket=client_socket)
+
+    except (ConnectionResetError, BrokenPipeError):
+        print(f"[INFO] Connection with {addr} was reset.")
+    except Exception as e:
+        print(f"[ERROR] {addr} error: {e}")
     finally:
-        # Graceful Disconnect
-        with clients_lock:
-            if client_socket in clients:
-                del clients[client_socket]
+        # Cleanup session only if this specific socket is still the "official" one
+        with sessions_lock:
+            if username and active_sessions.get(username) == client_socket:
+                del active_sessions[username]
+                # Only broadcast "left the chat" if they weren't forced out
+                broadcast(f"SYSTEM: {username} has left the chat.")
         
-        client_socket.close()
-        print(f"[DISCONNECT] {client_address} disconnected.")
-        broadcast(f"Client {client_address} has left the chat.")
+        try:
+            client_socket.close()
+        except:
+            pass
+        print(f"[DISCONNECT] {addr} disconnected.")
 
 def start_server():
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_socket.bind((HOST, PORT))
-    server_socket.listen()
-    
-    print(f"[LISTENING] Server is listening on {HOST}:{PORT}")
-    
-    try:
-        while True:
-            # Main thread blocks here waiting for new connections
-            client_socket, client_address = server_socket.accept()
-            
-            # Problem 1 Requirement: One thread per connected client
-            thread = threading.Thread(target=handle_client, args=(client_socket, client_address))
-            thread.daemon = True # Allows server to exit even if threads are running
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind((HOST, PORT))
+    server.listen()
+    print(f"[*] Server listening on {HOST}:{PORT}")
+
+    while True:
+        try:
+            conn, addr = server.accept()
+            # Problem 1: One thread per client
+            thread = threading.Thread(target=handle_client, args=(conn, addr))
+            thread.daemon = True
             thread.start()
-            print(f"[ACTIVE CONNECTIONS] {threading.active_count() - 1}")
-    except KeyboardInterrupt:
-        print("\n[SHUTTING DOWN] Server is stopping.")
-    finally:
-        server_socket.close()
+        except KeyboardInterrupt:
+            break
 
 if __name__ == "__main__":
     start_server()
