@@ -1,0 +1,36 @@
+services:
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 1s
+      retries: 10
+      timeout: 1s
+
+  server1:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    environment:
+      - SERVER_ID=server1
+      - REDIS_HOST=redis
+    ports:
+      - "65432:65432"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  server2:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    environment:
+      - SERVER_ID=server2
+      - REDIS_HOST=redis
+    ports:
+      - "65433:65432"
+    depends_on:
+      redis:
+        condition: service_healthy

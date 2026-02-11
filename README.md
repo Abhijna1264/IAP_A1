@@ -14,6 +14,8 @@ A1/
 ├── docs/
 │   └── report.pdf          # Your 2-4 page design report
 ├── requirements.txt        # bcrypt, redis, etc.
+├── server.key
+├── server.crt
 └── README.md               # Setup and testing instructions
 </pre>
 

@@ -1,247 +1,307 @@
+# ============================================================
+# server.py
+# Internet Architecture & Protocols - Assignment 1
+#
+# Covers:
+# Problem 1: Thread-based TCP server
+# Problem 2: Authentication with bcrypt
+# Problem 3: Duplicate login handling (Reject policy)
+# Problem 4: Chat rooms
+# Problem 5: Publish-Subscribe (user subscriptions)
+# Problem 6: Redis distributed state + Pub/Sub
+# Problem 7: TLS encrypted transport
+# Problem 8: Docker-compatible stateless server
+# ============================================================
+
 import socket
+import ssl
 import threading
 import bcrypt
+import redis
+import json
+import os
+from datetime import datetime
+import signal
 
-# Configuration
-HOST = '127.0.0.1'
+shutdown_event = threading.Event()
+
+# ------------------ CONFIG ------------------
+HOST = "0.0.0.0"
 PORT = 65432
+SERVER_ID = os.getenv("SERVER_ID", "server1")
 
-# ------------------ USER DATABASE (Problem 2) ------------------
-user_db = {
-    "abhijna": bcrypt.hashpw("kgp123".encode(), bcrypt.gensalt()),
-    "gemini": bcrypt.hashpw("password123".encode(), bcrypt.gensalt())
-}
+# ------------------ REDIS ------------------
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")   # use env variable, default localhost
+REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 
-# ------------------ ACTIVE SESSIONS (Problem 1 & 3) ------------------
-active_sessions = {}          # username -> socket
-sessions_lock = threading.Lock()
+r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
 
-# ------------------ Problem 4: CHAT ROOMS ------------------
-rooms = {"lobby": set()}      # room_name -> set(usernames)
-user_room = {}                # username -> room_name
-room_lock = threading.Lock()
-
-# ------------------ Problem 5: PUBLISH–SUBSCRIBE ------------------
-subscriptions = {}            # publisher -> set(subscribers)
-sub_lock = threading.Lock()
+# ------------------ LOCAL SOCKET STATE ------------------
+local_clients = {}          # username -> socket
+lock = threading.Lock()
 
 
-# ------------------ BROADCAST (USED ONLY FOR SYSTEM MESSAGES) ------------------
-def broadcast(message, sender_socket=None):
-    with sessions_lock:
-        for sock in active_sessions.values():
-            if sock != sender_socket:
-                try:
-                    sock.sendall(f"{message}\n".encode())
-                except:
-                    pass
+def now():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def print_connected_clients():
+    with lock:
+        users = list(local_clients.keys())
+    print(f"[{now()}] [CONNECTED CLIENTS] {users if users else 'None'}")
 
 
-# ------------------ ROOM MESSAGE ------------------
-def send_to_room(sender, message):
-    with room_lock:
-        room = user_room.get(sender)
-        recipients = rooms.get(room, set()).copy()
+# ============================================================
+# Problem 6: Redis Pub/Sub Listener
+# ============================================================
+def redis_listener():
+    pubsub = r.pubsub()
+    pubsub.subscribe("global_chat")
+    print(f"[{now()}] [REDIS] Pub/Sub listener started")
 
-    with sessions_lock:
-        for user in recipients:
-            if user != sender and user in active_sessions:
-                try:
-                    active_sessions[user].sendall(
-                        f"[{room}] {sender}: {message}\n".encode()
-                    )
-                except:
-                    pass
+    for msg in pubsub.listen():
+        if shutdown_event.is_set():
+            break
+
+        if msg["type"] != "message":
+            continue
+
+        data = json.loads(msg["data"])
+        sender = data["sender"]
+        targets = data["targets"]
+        text = data["message"]
+        ts = data["timestamp"]
+
+        with lock:
+            for user in targets:
+                if user in local_clients:
+                    try:
+                        local_clients[user].sendall(
+                            f"[{ts}] [{sender}] {text}\n".encode()
+                        )
+                    except:
+                        pass
 
 
-# ------------------ PUBLISH MESSAGE ------------------
-def publish_message(sender, message):
-    with sub_lock:
-        subs = subscriptions.get(sender, set()).copy()
-
-    with sessions_lock:
-        for user in subs:
-            if user in active_sessions:
-                try:
-                    active_sessions[user].sendall(
-                        f"[PUB] {sender}: {message}\n".encode()
-                    )
-                except:
-                    pass
-
-
-# ------------------ CLIENT HANDLER ------------------
-def handle_client(client_socket, addr):
+# ============================================================
+# Problem 1–5: Client Handler
+# ============================================================
+def handle_client(conn, addr):
+    #conn.settimeout(30) # detect dead clients (stale sessions)
     username = None
+    print(f"[{now()}] [THREAD START] Handling client {addr}")
 
     try:
-        # -------- AUTHENTICATION PHASE (Problem 2 & 3) --------
+        # -------- Authentication --------
+        conn.sendall(b"LOGIN <username> <password>\n")
+        # data = conn.recv(1024)
+        # if not data:
+        #     return
+
+        # parts = data.decode().strip().split()
+        # buffer = b""
+        # while b"\n" not in buffer:
+        #     chunk = conn.recv(1024)
+        #     if not chunk:
+        #         return
+        #     buffer += chunk
+
+        # line = buffer.decode().strip()
+        # parts = line.split()
+        conn_file = conn.makefile("r")
+
+        line = conn_file.readline()
+        if not line:
+            return
+
+        parts = line.strip().split()
+
+
+        if len(parts) != 3 or parts[0].upper() != "LOGIN":
+            conn.sendall(b"ERROR: Invalid LOGIN format\n")
+            return
+
+        _, user, pwd = parts
+        user_key = f"users:{user}" #authentication
+
+        # Auto-register
+        if not r.exists(user_key):
+            hashed = bcrypt.hashpw(pwd.encode(), bcrypt.gensalt()).decode()
+            r.hset(user_key, "password", hashed)
+            print(f"[{now()}] [REGISTER] New user '{user}'")
+
+        stored_hash = r.hget(user_key, "password").encode()
+        if not bcrypt.checkpw(pwd.encode(), stored_hash):
+            conn.sendall(b"AUTH_FAILED\n")
+            return
+
+        # -------- Duplicate Login --------
+        if r.hexists("sessions", user):
+            conn.sendall(b"ERROR: User already logged in\n")
+            print(f"[{now()}] [DUPLICATE LOGIN] {user}")
+            return
+
+        # -------- Session Setup --------
+        r.hset("sessions", user, SERVER_ID)
+        r.set(f"user_room:{user}", "lobby")
+        r.sadd("room:lobby", user)
+
+        with lock:
+            local_clients[user] = conn
+
+        username = user
+        conn.sendall(b"AUTH_SUCCESS\n")
+        print(f"[{now()}] [LOGIN] User '{user}' logged in")
+
+        # -------- Chat Loop --------
         while True:
-            client_socket.sendall(
-                b"AUTH_REQUIRED: LOGIN <username> <password>\n"
-            )
-            data = client_socket.recv(1024).decode().strip()
-            if not data:
-                return
-
-            parts = data.split()
-            if len(parts) == 3 and parts[0].upper() == "LOGIN":
-                input_user, input_pass = parts[1], parts[2]
-
-                if input_user in user_db and bcrypt.checkpw(
-                    input_pass.encode(), user_db[input_user]
-                ):
-                    with sessions_lock:
-                        if input_user in active_sessions:
-                            old_sock = active_sessions[input_user]
-                            try:
-                                old_sock.sendall(
-                                    b"FORCED_LOGOUT: Logged in elsewhere\n"
-                                )
-                                old_sock.close()
-                            except:
-                                pass
-
-                        active_sessions[input_user] = client_socket
-                        username = input_user
-
-                    client_socket.sendall(
-                        f"AUTH_SUCCESS: Welcome {username}\n".encode()
-                    )
-                    broadcast(f"SYSTEM: {username} joined the chat")
-
-                    # Default room = lobby (Problem 4)
-                    with room_lock:
-                        rooms["lobby"].add(username)
-                        user_room[username] = "lobby"
-
+            try:
+                data = conn.recv(4096)
+                if not data:
                     break
-                else:
-                    client_socket.sendall(
-                        b"AUTH_FAILED: Invalid credentials\n"
-                    )
-            else:
-                client_socket.sendall(
-                    b"ERROR: LOGIN <username> <password>\n"
-                )
-
-        # -------- CHAT PHASE (Problem 4 & 5) --------
-        while True:
-            data = client_socket.recv(1024)
-            if not data:
+            except socket.timeout:
+                print(f"[{now()}] [TIMEOUT] {username} inactive, closing session")
                 break
-
-            with sessions_lock:
-                if active_sessions.get(username) != client_socket:
-                    return
 
             msg = data.decode().strip()
             if not msg:
                 continue
 
-            # ----- Room commands -----
-            if msg.startswith("/join "):
-                room_name = msg.split(maxsplit=1)[1]
-                with room_lock:
-                    old_room = user_room.get(username)
-                    if old_room:
-                        rooms[old_room].discard(username)
-                    rooms.setdefault(room_name, set()).add(username)
-                    user_room[username] = room_name
-                client_socket.sendall(
-                    f"You joined room: {room_name}\n".encode()
+            print(f"[{now()}] [RECV] {username}: {msg}")
+
+            # Logout command
+            if msg == "/quit":
+                conn.sendall(b"LOGOUT_SUCCESS\n")
+                break
+            # -------- Rooms --------
+            elif msg.startswith("/join "):
+                new_room = msg.split(maxsplit=1)[1]
+                old_room = r.get(f"user_room:{username}")
+
+                r.srem(f"room:{old_room}", username)
+                r.sadd(f"room:{new_room}", username)
+                r.set(f"user_room:{username}", new_room)
+
+                conn.sendall(f"[{now()}] Joined room {new_room}\n".encode())
+                print(f"[{now()}] [ROOM] {username} moved {old_room} → {new_room}")
+            
+            elif msg == "/who":
+                with lock:
+                    users = list(local_clients.keys())
+                conn.sendall(
+                    f"[{now()}] Connected users: {', '.join(users) if users else 'None'}\n".encode()
                 )
+
 
             elif msg == "/leave":
-                with room_lock:
-                    old_room = user_room.get(username)
-                    if old_room:
-                        rooms[old_room].discard(username)
-                    rooms["lobby"].add(username)
-                    user_room[username] = "lobby"
-                client_socket.sendall(
-                    b"You returned to lobby\n"
-                )
+                old_room = r.get(f"user_room:{username}")
+
+                r.srem(f"room:{old_room}", username)
+                r.sadd("room:lobby", username)
+                r.set(f"user_room:{username}", "lobby")
+
+                conn.sendall(f"[{now()}] Returned to lobby\n".encode())
+                print(f"[{now()}] [ROOM] {username} returned to lobby")
 
             elif msg == "/rooms":
-                with room_lock:
-                    room_list = ", ".join(rooms.keys())
-                client_socket.sendall(
-                    f"Rooms: {room_list}\n".encode()
-                )
+                rooms = sorted({k.split(":")[1] for k in r.scan_iter("room:*")})
+                conn.sendall(f"[{now()}] Rooms: {', '.join(rooms)}\n".encode())
 
-            # ----- Pub–Sub commands -----
+            # -------- Subscribe --------
             elif msg.startswith("/subscribe "):
                 target = msg.split(maxsplit=1)[1]
-                with sub_lock:
-                    subscriptions.setdefault(target, set()).add(username)
-                client_socket.sendall(
-                    f"Subscribed to {target}\n".encode()
-                )
+                r.sadd(f"subs:{target}", username)
+                conn.sendall(f"[{now()}] Subscribed to {target}\n".encode())
+                print(f"[{now()}] [SUBSCRIBE] {username} → {target}")
 
             elif msg.startswith("/unsubscribe "):
                 target = msg.split(maxsplit=1)[1]
-                with sub_lock:
-                    if target in subscriptions:
-                        subscriptions[target].discard(username)
-                client_socket.sendall(
-                    f"Unsubscribed from {target}\n".encode()
-                )
+                r.srem(f"subs:{target}", username)
+                conn.sendall(f"[{now()}] Unsubscribed from {target}\n".encode())
+                print(f"[{now()}] [UNSUBSCRIBE] {username} → {target}")
 
-            # ----- Normal message -----
+            # -------- Publish Message --------
             else:
-                print(f"[{username}] {msg}")
-                send_to_room(username, msg)
-                publish_message(username, msg)
+                room = r.get(f"user_room:{username}")
+                room_users = r.smembers(f"room:{room}")
+                subs = r.smembers(f"subs:{username}")
 
-    except Exception as e:
-        print(f"[ERROR] {addr}: {e}")
+                targets = set(room_users) | set(subs)
+                targets.discard(username)
+
+                payload = json.dumps({
+                    "sender": username,
+                    "targets": list(targets),
+                    "message": msg,
+                    "timestamp": now()
+                })
+
+                r.publish("global_chat", payload)
+                print(f"[{now()}] [PUBLISH] {username} → {targets}")
 
     finally:
-        # Cleanup rooms
-        with room_lock:
-            room = user_room.pop(username, None)
+        # -------- Cleanup --------
+        if username and r.hexists("sessions", username):
+            r.hdel("sessions", username)
+
+            room = r.get(f"user_room:{username}")
             if room:
-                rooms[room].discard(username)
+                r.srem(f"room:{room}", username)
 
-        # Cleanup subscriptions
-        with sub_lock:
-            subscriptions.pop(username, None)
-            for subs in subscriptions.values():
-                subs.discard(username)
+            with lock:
+                local_clients.pop(username, None)
 
-        # Cleanup session
-        with sessions_lock:
-            if username and active_sessions.get(username) == client_socket:
-                del active_sessions[username]
-                broadcast(f"SYSTEM: {username} left the chat")
+            print(f"[{now()}] [LOGOUT] {username}")
+            print_connected_clients()
 
-        try:
-            client_socket.close()
-        except:
-            pass
-
-        print(f"[DISCONNECT] {addr}")
+        conn.close()
+        print(f"[{now()}] [DISCONNECT] {addr}")
 
 
-# ------------------ SERVER START ------------------
+# ============================================================
+# Server Startup
+# ============================================================
+def shutdown_handler(sig, frame):
+    print(f"\n[{now()}] [SERVER SHUTDOWN] Ctrl+C received")
+    shutdown_event.set()
+
+
 def start_server():
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((HOST, PORT))
-    server.listen()
-    print(f"[*] Server listening on {HOST}:{PORT}")
+    threading.Thread(target=redis_listener, daemon=True).start()
 
-    while True:
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain("server.crt", "server.key")
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind((HOST, PORT))
+    sock.listen()
+    sock.settimeout(1.0)
+
+    print(f"[{now()}] [{SERVER_ID}] TLS server listening on port {PORT}")
+    print_connected_clients()
+
+    while not shutdown_event.is_set():
         try:
-            conn, addr = server.accept()
-            t = threading.Thread(
-                target=handle_client, args=(conn, addr), daemon=True
-            )
-            t.start()
-        except KeyboardInterrupt:
-            break
+            conn, addr = sock.accept()
+        except socket.timeout:
+            continue
+
+        print(f"[{now()}] [CONNECT] TCP from {addr}")
+
+        try:
+            tls_conn = context.wrap_socket(conn, server_side=True)
+            print(f"[{now()}] [TLS] Handshake OK {addr}")
+        except ssl.SSLError as e:
+            print(f"[{now()}] [TLS ERROR] {addr} {e}")
+            conn.close()
+            continue
+
+        threading.Thread(
+            target=handle_client,
+            args=(tls_conn, addr),
+            daemon=True
+        ).start()
 
 
 if __name__ == "__main__":
+    signal.signal(signal.SIGINT, shutdown_handler)
     start_server()
